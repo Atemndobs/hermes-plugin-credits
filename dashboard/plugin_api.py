@@ -114,7 +114,37 @@ def _claude_oauth_from_file() -> tuple[str | None, str | None]:
 
     now_ms = int(time.time() * 1000)
 
-    # 1) Hermes-managed file first.
+    # 1) Hermes auth pool (~/.hermes/auth.json) — populated by `hermes auth
+    #    add anthropic`. Highest-priority oauth credential is used.
+    pool_path = Path.home() / ".hermes" / "auth.json"
+    if pool_path.exists():
+        try:
+            data = json.loads(pool_path.read_text())
+            entries = (data.get("credential_pool") or {}).get("anthropic") or []
+            # Prefer non-env credentials (manual OAuth from PKCE flow).
+            entries = sorted(
+                entries,
+                key=lambda e: (
+                    e.get("source", "").startswith("env"),
+                    -(e.get("priority") or 0),
+                ),
+            )
+            for e in entries:
+                if e.get("auth_type") != "oauth":
+                    continue
+                access = e.get("access_token")
+                refresh = e.get("refresh_token")
+                exp = int(e.get("expires_at_ms") or 0)
+                if access and (exp == 0 or exp > now_ms + 60_000):
+                    return access, "hermes_pool"
+                if refresh:
+                    t = _refresh_anthropic_pool(refresh, pool_path, e["id"])
+                    if t:
+                        return t, "hermes_pool"
+        except Exception:
+            pass
+
+    # 2) Legacy Hermes-only file (older versions).
     hermes_path = Path.home() / ".hermes" / ".anthropic_oauth.json"
     if hermes_path.exists():
         try:
@@ -131,7 +161,7 @@ def _claude_oauth_from_file() -> tuple[str | None, str | None]:
         except Exception:
             pass
 
-    # 2) Claude Code's credentials file.
+    # 3) Claude Code's credentials file.
     p = Path.home() / ".claude" / ".credentials.json"
     if not p.exists():
         return None, None
@@ -153,6 +183,51 @@ def _claude_oauth_from_file() -> tuple[str | None, str | None]:
         if t:
             return t, "claude_code"
     return access, "claude_code"
+
+
+def _refresh_anthropic_pool(refresh: str, pool_path, cred_id: str) -> str | None:
+    """Refresh an Anthropic credential stored in ~/.hermes/auth.json's pool."""
+    import json
+    import time
+    try:
+        with httpx.Client(timeout=8) as c:
+            for endpoint in (
+                "https://platform.claude.com/v1/oauth/token",
+                "https://console.anthropic.com/v1/oauth/token",
+            ):
+                r = c.post(
+                    endpoint,
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": refresh,
+                        "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                    },
+                )
+                if r.status_code != 200:
+                    continue
+                payload = r.json()
+                new_access = payload.get("access_token")
+                new_refresh = payload.get("refresh_token") or refresh
+                expires_in = int(payload.get("expires_in") or 3600)
+                if not new_access:
+                    continue
+                # Persist back into the pool.
+                try:
+                    data = json.loads(pool_path.read_text())
+                    entries = (data.get("credential_pool") or {}).get("anthropic") or []
+                    for e in entries:
+                        if e.get("id") == cred_id:
+                            e["access_token"] = new_access
+                            e["refresh_token"] = new_refresh
+                            e["expires_at_ms"] = int(time.time() * 1000) + expires_in * 1000
+                            break
+                    pool_path.write_text(json.dumps(data, indent=2))
+                except Exception:
+                    pass
+                return new_access
+    except Exception:
+        pass
+    return None
 
 
 def _refresh_anthropic(
