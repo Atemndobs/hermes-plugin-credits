@@ -1,0 +1,10 @@
+{
+  "name": "credits",
+  "label": "Credits",
+  "description": "Provider credit/quota overview (OpenRouter, Anthropic)",
+  "icon": "Wallet",
+  "version": "1.0.0",
+  "slots": ["analytics:top"],
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
