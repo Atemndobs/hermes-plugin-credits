@@ -118,15 +118,31 @@
           p.hint && React.createElement("span", { className: "text-[10px] text-muted-foreground" }, p.hint),
         );
       }
-      if (p.auth === "oauth" && !footnote) {
-        footnote = "Claude Code subscription";
+      // Stamp plan + monthly price wherever Anthropic OAuth is in use,
+      // even on probe failure — gives the user the cost context up front.
+      if (p.auth === "oauth") {
+        const planLabel = (p.plan || "").toString();
+        const priceLabel =
+          p.plan_price_usd === 0 ? "free"
+            : p.plan_price_usd != null ? "$" + p.plan_price_usd + "/mo"
+            : null;
+        const sub = planLabel
+          ? "Claude " + planLabel.charAt(0).toUpperCase() + planLabel.slice(1) +
+            (priceLabel ? " · " + priceLabel : "")
+          : "Claude Code subscription";
+        footnote = footnote ? sub + " · " + footnote : sub;
       }
     } else if (name === "openai") {
       if (p.auth === "codex_oauth") {
-        // ChatGPT subscription — no usage API; show plan only.
+        // ChatGPT subscription — no usage API; show plan + monthly price.
+        const priceLabel =
+          p.plan_price_usd === 0 ? "free"
+            : p.plan_price_usd != null ? "$" + p.plan_price_usd + "/mo"
+            : "custom";
         main = React.createElement("div", { className: "flex items-baseline gap-2" },
           React.createElement("span", { className: "text-2xl font-semibold capitalize" }, p.plan || "active"),
           React.createElement("span", { className: "text-xs text-muted-foreground" }, "ChatGPT plan"),
+          React.createElement("span", { className: "ml-auto text-xs tabular-nums text-muted-foreground" }, priceLabel),
         );
         footnote = "subscription quota not exposed via API";
       } else if (p.tokens_remaining != null && p.tokens_limit) {

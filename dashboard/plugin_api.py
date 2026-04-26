@@ -20,6 +20,27 @@ router = APIRouter()
 TIMEOUT = httpx.Timeout(6.0, connect=3.0)
 
 
+# Subscription monthly prices (USD). Sources: openai.com/chatgpt/pricing,
+# anthropic.com/pricing as of 2026. Update when providers shift pricing.
+CHATGPT_PLAN_PRICE_USD = {
+    "free": 0,
+    "plus": 20,
+    "pro": 200,
+    "team": 30,        # per user / month
+    "business": 30,    # alias surfaced by some endpoints
+    "enterprise": None,  # custom — show "custom"
+    "edu": 0,
+}
+CLAUDE_PLAN_PRICE_USD = {
+    "pro": 20,
+    "max": 100,        # Max 5x baseline; Max 20x is 200
+    "max_5x": 100,
+    "max_20x": 200,
+    "team": 30,
+    "enterprise": None,
+}
+
+
 async def _openrouter(client: httpx.AsyncClient) -> dict[str, Any]:
     key = os.getenv("OPENROUTER_API_KEY")
     if not key:
@@ -60,77 +81,137 @@ def _hdr_int(headers, name: str):
         return None
 
 
-def _claude_oauth_from_file() -> str | None:
-    """Get a working Anthropic OAuth access token.
-
-    Reads ~/.claude/.credentials.json. If the token is expired (which it
-    usually is — Claude Code refreshes only on use), runs the standard
-    refresh-token grant against Anthropic's OAuth endpoint to mint a fresh
-    one. Doesn't rely on macOS keychain access (launchd-spawned dashboard
-    has none) or on Hermes's `resolve_anthropic_token` (which prefers the
-    keychain).
-    """
+def _claude_subscription_label() -> str | None:
+    """Return the Claude subscription tier from the local creds file."""
     import json
-    import time
     from pathlib import Path
-
     p = Path.home() / ".claude" / ".credentials.json"
     if not p.exists():
         return None
     try:
         data = json.loads(p.read_text())
+        return data.get("claudeAiOauth", {}).get("subscriptionType")
     except Exception:
         return None
+
+
+def _claude_oauth_from_file() -> tuple[str | None, str | None]:
+    """Get a working Anthropic OAuth access token.
+
+    Tries (in order):
+      1. ~/.hermes/.anthropic_oauth.json — Hermes-managed; refreshes cleanly
+         since Hermes writes here AND the dashboard runs from this same
+         install. No keychain access needed.
+      2. ~/.claude/.credentials.json — fallback. Refreshable only if Claude
+         Code hasn't already burned the refresh token (single-use rotation).
+
+    Returns (access_token, source_label) so we can surface why a refresh
+    might fail.
+    """
+    import json
+    import time
+    from pathlib import Path
+
+    now_ms = int(time.time() * 1000)
+
+    # 1) Hermes-managed file first.
+    hermes_path = Path.home() / ".hermes" / ".anthropic_oauth.json"
+    if hermes_path.exists():
+        try:
+            data = json.loads(hermes_path.read_text())
+            access = data.get("accessToken") or data.get("access_token")
+            refresh = data.get("refreshToken") or data.get("refresh_token")
+            exp = int(data.get("expiresAt") or data.get("expires_at_ms") or 0)
+            if access and exp > now_ms + 60_000:
+                return access, "hermes_oauth"
+            if refresh:
+                t = _refresh_anthropic(refresh, hermes_path, hermes_format=True)
+                if t:
+                    return t, "hermes_oauth"
+        except Exception:
+            pass
+
+    # 2) Claude Code's credentials file.
+    p = Path.home() / ".claude" / ".credentials.json"
+    if not p.exists():
+        return None, None
+    try:
+        data = json.loads(p.read_text())
+    except Exception:
+        return None, None
 
     creds = data.get("claudeAiOauth", {}) or {}
     access = creds.get("accessToken")
     refresh = creds.get("refreshToken")
     expires_at_ms = int(creds.get("expiresAt") or 0)
-    now_ms = int(time.time() * 1000)
 
-    # Use cached access token if it's still valid for >60s.
     if access and expires_at_ms > now_ms + 60_000:
-        return access
+        return access, "claude_code"
 
-    # Otherwise refresh. Use httpx (with certifi-bundled CAs) — urllib uses the
-    # framework Python's missing system trust store on macOS.
-    if not refresh:
-        return access
+    if refresh:
+        t = _refresh_anthropic(refresh, p, hermes_format=False, claude_data=data)
+        if t:
+            return t, "claude_code"
+    return access, "claude_code"
+
+
+def _refresh_anthropic(
+    refresh: str,
+    file_path,
+    hermes_format: bool,
+    claude_data: dict | None = None,
+) -> str | None:
+    """Run the Anthropic OAuth refresh-token grant and persist the result.
+
+    Single-use rotation: each refresh issues a new refresh_token; older ones
+    are invalidated. Returns the new access token or None on failure.
+    """
+    import json
+    import time
     try:
-        import httpx
-        body = {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh,
-            "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-        }
         with httpx.Client(timeout=8) as c:
             for endpoint in (
                 "https://platform.claude.com/v1/oauth/token",
                 "https://console.anthropic.com/v1/oauth/token",
             ):
                 try:
-                    r = c.post(endpoint, data=body)
+                    r = c.post(
+                        endpoint,
+                        data={
+                            "grant_type": "refresh_token",
+                            "refresh_token": refresh,
+                            "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                        },
+                    )
                     if r.status_code != 200:
                         continue
                     payload = r.json()
                     new_access = payload.get("access_token")
                     new_refresh = payload.get("refresh_token") or refresh
                     expires_in = int(payload.get("expires_in") or 3600)
-                    if new_access:
-                        creds["accessToken"] = new_access
-                        creds["refreshToken"] = new_refresh
-                        creds["expiresAt"] = now_ms + expires_in * 1000
-                        data["claudeAiOauth"] = creds
-                        try:
-                            p.write_text(json.dumps(data, indent=2))
-                        except Exception:
-                            pass
-                        return new_access
+                    if not new_access:
+                        continue
+                    new_exp = int(time.time() * 1000) + expires_in * 1000
+                    try:
+                        if hermes_format:
+                            file_path.write_text(json.dumps({
+                                "accessToken": new_access,
+                                "refreshToken": new_refresh,
+                                "expiresAt": new_exp,
+                            }, indent=2))
+                        elif claude_data is not None:
+                            claude_data["claudeAiOauth"]["accessToken"] = new_access
+                            claude_data["claudeAiOauth"]["refreshToken"] = new_refresh
+                            claude_data["claudeAiOauth"]["expiresAt"] = new_exp
+                            file_path.write_text(json.dumps(claude_data, indent=2))
+                    except Exception:
+                        pass
+                    return new_access
                 except Exception:
                     continue
     except Exception:
         pass
-    return access
+    return None
 
 
 async def _anthropic(client: httpx.AsyncClient) -> dict[str, Any]:
@@ -142,30 +223,20 @@ async def _anthropic(client: httpx.AsyncClient) -> dict[str, Any]:
     Auth precedence: ANTHROPIC_API_KEY > CLAUDE_CODE_OAUTH_TOKEN > ~/.claude/.credentials.json.
     """
     api_key = os.getenv("ANTHROPIC_API_KEY")
-    oauth = os.getenv("CLAUDE_CODE_OAUTH_TOKEN") or _claude_oauth_from_file()
-    if not api_key and not oauth:
+    oauth_token: str | None = os.getenv("CLAUDE_CODE_OAUTH_TOKEN")
+    oauth_source: str | None = "env" if oauth_token else None
+    if not oauth_token:
+        oauth_token, oauth_source = _claude_oauth_from_file()
+    if not api_key and not oauth_token:
         return {"provider": "anthropic", "configured": False}
-    # Detect if our OAuth token is the stale one from disk (refresh likely
-    # failed because Claude Code rotated the refresh_token in the keychain).
-    oauth_stale = False
-    if not api_key and oauth:
-        try:
-            import json, time
-            from pathlib import Path
-            creds_path = Path.home() / ".claude" / ".credentials.json"
-            if creds_path.exists():
-                d = json.loads(creds_path.read_text())
-                exp_ms = int(d.get("claudeAiOauth", {}).get("expiresAt") or 0)
-                oauth_stale = exp_ms < int(time.time() * 1000)
-        except Exception:
-            pass
+    plan = _claude_subscription_label()  # e.g. "max", "pro"
 
     headers = {"anthropic-version": "2023-06-01"}
     auth_kind = "api_key"
     if api_key:
         headers["x-api-key"] = api_key
     else:
-        headers["Authorization"] = f"Bearer {oauth}"
+        headers["Authorization"] = f"Bearer {oauth_token}"
         headers["anthropic-beta"] = "oauth-2025-04-20"
         auth_kind = "oauth"
 
@@ -197,11 +268,16 @@ async def _anthropic(client: httpx.AsyncClient) -> dict[str, Any]:
             except (ValueError, TypeError):
                 return v       # ISO-8601 string (legacy)
 
+        normalized_plan = (plan or "").lower().replace("-", "_")
+        plan_price = CLAUDE_PLAN_PRICE_USD.get(normalized_plan)
         out = {
             "provider": "anthropic",
             "configured": True,
             "ok": r.is_success,
             "auth": auth_kind,
+            "plan": plan,
+            "plan_price_usd": plan_price,
+            "oauth_source": oauth_source,
             # Claude Pro/Max subscription (unified headers, utilization 0..1)
             "unified_5h_utilization": _flt("anthropic-ratelimit-unified-5h-utilization"),
             "unified_5h_status": h.get("anthropic-ratelimit-unified-5h-status"),
@@ -217,16 +293,20 @@ async def _anthropic(client: httpx.AsyncClient) -> dict[str, Any]:
             "requests_limit": _hdr_int(h, "anthropic-ratelimit-requests-limit"),
         }
         if not r.is_success:
-            if r.status_code == 401 and auth_kind == "oauth" and oauth_stale:
-                out["error"] = "OAuth token expired and refresh blocked (keychain access)"
-                out["hint"] = "Set ANTHROPIC_API_KEY in ~/.hermes/.env, or run a Claude Code session to refresh"
+            if r.status_code == 401 and auth_kind == "oauth":
+                out["error"] = "OAuth token rejected"
+                out["hint"] = (
+                    "Run `hermes auth add anthropic` once to mint a fresh "
+                    "Hermes-managed OAuth token (writes to "
+                    "~/.hermes/.anthropic_oauth.json)."
+                )
             else:
                 out["error"] = f"HTTP {r.status_code}"
         return out
     except Exception as e:
         return {
             "provider": "anthropic", "configured": True, "ok": False,
-            "auth": auth_kind, "error": str(e)[:200],
+            "auth": auth_kind, "plan": plan, "error": str(e)[:200],
         }
 
 
@@ -280,12 +360,15 @@ async def _openai(client: httpx.AsyncClient) -> dict[str, Any]:
         id_token = (tokens or {}).get("id_token")
         if id_token:
             plan = _codex_plan_from_jwt(id_token)
+        normalized_plan = (plan or "").lower().replace("-", "_")
+        plan_price = CHATGPT_PLAN_PRICE_USD.get(normalized_plan)
         return {
             "provider": "openai",
             "configured": True,
             "ok": True,
             "auth": "codex_oauth",
             "plan": plan,  # "plus", "pro", "free", etc.
+            "plan_price_usd": plan_price,
             "note": "ChatGPT subscription; usage limits not exposed via API.",
         }
     try:
