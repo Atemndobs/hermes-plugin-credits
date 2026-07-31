@@ -1,0 +1,11 @@
+name: credits
+version: 1.3.0
+description: >-
+  Provider credits for agents and humans — credits_status tool plus /credits
+  slash command. Reuses the dashboard probe backend (OpenRouter, Anthropic,
+  OpenAI, FAL, Atlas, RunPod, Replicate, Tavily, Firecrawl). Returns sanitized
+  balances only (no API key material).
+author: Dirt-Nasty
+kind: standalone
+provides_tools:
+  - credits_status

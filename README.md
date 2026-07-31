@@ -1,8 +1,12 @@
 # hermes-plugin-credits
 
-A Hermes Agent dashboard plugin that adds a **Provider Credits** widget to the
-Analytics page (and a `/credits` tab). At a glance you see how much you have
-left across your model and tool providers — no need to bounce between billing tabs.
+A Hermes Agent plugin with two surfaces:
+
+1. **Dashboard** — Provider Credits widget on Analytics + a `/credits` tab
+2. **Agent** — `credits_status` tool and `/credits` slash command (sanitized balances, no key material)
+
+At a glance you see how much you have left across your model and tool
+providers — no need to bounce between billing tabs or DIY OpenRouter probes.
 
 ## What it shows
 
@@ -51,9 +55,30 @@ plugins:
 
 Then restart the dashboard (or rescan **and** restart — plugin API routes mount at process start).
 
+For the **agent tool / slash command**, enable the same `credits` name (or the
+folder key `hermes-plugin-credits`) in the **profile** that runs the gateway
+(e.g. forge `config.yaml`), then bounce the gateway:
+
+```yaml
+plugins:
+  enabled:
+    - credits
+    - image_gen/atlas   # whatever else you already use
+```
+
+### Agent usage
+
+| Surface | How |
+|---|---|
+| Tool | `credits_status` — optional `force`, optional `provider` |
+| Slash | `/credits` · `/credits refresh` · `/credits openrouter` |
+
+Both reuse `dashboard/plugin_api.py` probes and strip key labels / secret-looking strings before returning.
+
 ## How it works
 
 * **Backend** — `dashboard/plugin_api.py` exposes `GET /api/plugins/credits/status`. Each provider is queried in parallel; failures degrade gracefully so one bad key doesn't blank the panel. Results are cached for 5 minutes since the Anthropic/OpenAI probes burn ~1 token each.
+* **Agent** — root `plugin.yaml` + `__init__.py` register `credits_status` and `/credits` via `PluginContext` (same pattern as Spotify / telemetry slash commands).
 * **Frontend** — `dashboard/dist/index.js` is a plain IIFE using the Hermes Plugin SDK (`window.__HERMES_PLUGIN_SDK__`). No build step needed.
 * **Slot + tab** — registers into `analytics:top` via `registerSlot`, and calls `register("credits", …)` so the `/credits` nav tab works.
 
