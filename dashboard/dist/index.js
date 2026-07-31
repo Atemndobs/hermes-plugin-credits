@@ -205,6 +205,68 @@
       } else {
         main = React.createElement("span", { className: "text-xs text-destructive" }, p.error || "probe failed");
       }
+    } else if (name === "fal" || name === "atlas" || name === "runpod") {
+      if (p.ok && p.remaining_usd != null) {
+        main = React.createElement("div", { className: "flex items-baseline gap-2" },
+          React.createElement("span", { className: "text-2xl font-semibold tabular-nums" }, fmtUSD(p.remaining_usd)),
+          React.createElement("span", { className: "text-xs text-muted-foreground" }, "balance"),
+        );
+        if (name === "runpod" && p.spend_per_hr_usd != null && p.spend_per_hr_usd > 0) {
+          footnote = "spend " + fmtUSD(p.spend_per_hr_usd) + "/hr";
+        } else if (name === "atlas" && p.bonus_usd != null && p.bonus_usd > 0) {
+          footnote = "incl. " + fmtUSD(p.bonus_usd) + " bonus";
+        } else if (p.username) {
+          footnote = "@" + p.username;
+        } else if (p.email) {
+          footnote = p.email;
+        }
+      } else if (p.ok) {
+        main = React.createElement("span", { className: "text-sm text-muted-foreground" }, "key valid; no balance returned");
+      } else {
+        main = React.createElement("div", { className: "flex flex-col gap-1" },
+          React.createElement("span", { className: "text-xs text-destructive" }, p.error || "probe failed"),
+          p.hint && React.createElement("span", { className: "text-[10px] text-muted-foreground" }, p.hint),
+        );
+      }
+    } else if (name === "replicate") {
+      if (p.ok) {
+        main = React.createElement("div", { className: "flex items-baseline gap-2" },
+          React.createElement("span", { className: "text-2xl font-semibold" }, "key ok"),
+          React.createElement("span", { className: "text-xs text-muted-foreground" }, "no balance API"),
+        );
+        footnote = p.username
+          ? "@" + p.username + (p.note ? " · " + p.note : "")
+          : (p.note || null);
+      } else {
+        main = React.createElement("span", { className: "text-xs text-destructive" }, p.error || "probe failed");
+      }
+    } else if (name === "tavily" || name === "firecrawl") {
+      if (p.ok && p.remaining != null && p.limit != null && p.remaining <= p.limit) {
+        const used = Math.max(0, p.limit - p.remaining);
+        const pct = p.limit > 0 ? Math.min(100, (used / p.limit) * 100) : 0;
+        main = React.createElement("div", { className: "flex items-baseline gap-2" },
+          React.createElement("span", { className: "text-2xl font-semibold tabular-nums" }, fmtNum(p.remaining)),
+          React.createElement("span", { className: "text-xs text-muted-foreground" }, "credits left"),
+          React.createElement("span", { className: "text-xs text-muted-foreground ml-auto tabular-nums" },
+            fmtNum(used) + " / " + fmtNum(p.limit)),
+        );
+        barEl = bar(pct);
+      } else if (p.ok && p.remaining != null) {
+        main = React.createElement("div", { className: "flex items-baseline gap-2" },
+          React.createElement("span", { className: "text-2xl font-semibold tabular-nums" }, fmtNum(p.remaining)),
+          React.createElement("span", { className: "text-xs text-muted-foreground" }, "credits left"),
+        );
+      } else if (p.ok && p.usage != null) {
+        main = React.createElement("div", { className: "flex items-baseline gap-2" },
+          React.createElement("span", { className: "text-2xl font-semibold tabular-nums" }, fmtNum(p.usage)),
+          React.createElement("span", { className: "text-xs text-muted-foreground" }, "credits used"),
+          p.limit == null && React.createElement(Badge, { variant: "outline", className: "ml-auto" }, "no cap"),
+        );
+      } else if (p.ok) {
+        main = React.createElement("span", { className: "text-sm text-muted-foreground" }, "key valid");
+      } else {
+        main = React.createElement("span", { className: "text-xs text-destructive" }, p.error || "probe failed");
+      }
     } else {
       main = React.createElement("span", { className: "text-sm" }, "key valid");
     }
@@ -227,17 +289,25 @@
     const [loading, setLoading] = useState(false);
     const [err, setErr] = useState(null);
 
-    const load = useCallback(function () {
+    const load = useCallback(function (force) {
       setLoading(true);
-      SDK.fetchJSON("/api/plugins/credits/status")
-        .then(function (d) { setData(d); setErr(null); })
+      const url = force
+        ? "/api/plugins/credits/status?force=true"
+        : "/api/plugins/credits/status";
+      SDK.fetchJSON(url)
+        .then(function (d) {
+          setData(d);
+          setErr(null);
+          window.__HERMES_CREDITS_AT__ = window.__HERMES_CREDITS_AT__ || { v: null };
+          window.__HERMES_CREDITS_AT__.v = Date.now();
+        })
         .catch(function (e) { setErr(String(e)); })
         .finally(function () { setLoading(false); });
     }, []);
 
     useEffect(function () {
-      load();
-      const t = setInterval(load, 60000);
+      load(false);
+      const t = setInterval(function () { load(false); }, 60000);
       return function () { clearInterval(t); };
     }, [load]);
 
@@ -255,7 +325,6 @@
     const fetchedAtRef = (window.__HERMES_CREDITS_AT__ = window.__HERMES_CREDITS_AT__ || { v: null });
     if (data && !fetchedAtRef.v) fetchedAtRef.v = Date.now();
     const dataAgeMs = data ? (data.age_seconds || 0) * 1000 + (Date.now() - (fetchedAtRef.v || Date.now())) : 0;
-    if (loading) fetchedAtRef.v = Date.now();
     void tick; // keep React hook closure alive
 
     function fmtAge(ms) {
@@ -277,7 +346,7 @@
           React.createElement(Button, {
             size: "sm",
             variant: "ghost",
-            onClick: load,
+            onClick: function () { load(true); },
             disabled: loading,
             className: stale ? "text-amber-400" : "",
           }, loading ? "..." : "Refresh"),
@@ -286,7 +355,7 @@
       React.createElement(CardContent, null,
         err && React.createElement("div", { className: "text-xs text-destructive mb-2" }, err),
         empty && React.createElement("div", { className: "text-xs text-muted-foreground" },
-          "No supported providers configured (OPENROUTER_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY)."),
+          "No supported providers configured (OPENROUTER / ANTHROPIC / OPENAI / FAL / ATLAS / RUNPOD / REPLICATE / TAVILY / FIRECRAWL keys)."),
         !empty && React.createElement("div", { className: "grid gap-3 md:grid-cols-2 lg:grid-cols-3" },
           providers.map(function (p) {
             return React.createElement(ProviderRow, { key: p.provider, p: p });
@@ -296,8 +365,19 @@
     );
   }
 
+  // Full /credits page (Hermes requires register() when the tab is visible).
+  function CreditsPage() {
+    return React.createElement("div", { className: "p-4 md:p-6 max-w-6xl mx-auto" },
+      React.createElement("h1", { className: "text-lg font-semibold mb-4" }, "Provider Credits"),
+      React.createElement(CreditsWidget, null),
+    );
+  }
+
   // Register into the analytics:top slot
   if (window.__HERMES_PLUGINS__ && window.__HERMES_PLUGINS__.registerSlot) {
     window.__HERMES_PLUGINS__.registerSlot("credits", "analytics:top", CreditsWidget);
+  }
+  if (window.__HERMES_PLUGINS__ && window.__HERMES_PLUGINS__.register) {
+    window.__HERMES_PLUGINS__.register("credits", CreditsPage);
   }
 })();

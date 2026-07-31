@@ -42,7 +42,7 @@ CLAUDE_PLAN_PRICE_USD = {
 
 
 async def _openrouter(client: httpx.AsyncClient) -> dict[str, Any]:
-    key = os.getenv("OPENROUTER_API_KEY")
+    key = _env_key("OPENROUTER_API_KEY")
     if not key:
         return {"provider": "openrouter", "configured": False}
     try:
@@ -297,8 +297,8 @@ async def _anthropic(client: httpx.AsyncClient) -> dict[str, Any]:
 
     Auth precedence: ANTHROPIC_API_KEY > CLAUDE_CODE_OAUTH_TOKEN > ~/.claude/.credentials.json.
     """
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    oauth_token: str | None = os.getenv("CLAUDE_CODE_OAUTH_TOKEN")
+    api_key = _env_key("ANTHROPIC_API_KEY")
+    oauth_token: str | None = _env_key("CLAUDE_CODE_OAUTH_TOKEN")
     oauth_source: str | None = "env" if oauth_token else None
     if not oauth_token:
         oauth_token, oauth_source = _claude_oauth_from_file()
@@ -417,16 +417,375 @@ def _codex_plan_from_jwt(id_token: str) -> str | None:
         return None
 
 
+def _bws_cache_secrets() -> dict[str, str]:
+    """Best-effort load of Bitwarden SM cache (Hermes forge / shared home).
+
+    Dashboard processes often lack the gateway's injected secrets; Hermes
+    still writes `cache/bws_cache.json` under profile or HERMES_HOME.
+    Returns {SECRET_NAME: value} — never logs values.
+    """
+    from pathlib import Path
+
+    candidates: list[Path] = []
+    hermes_home = Path(os.getenv("HERMES_HOME") or Path.home())
+    # Prefer forge profile cache when present (common on OVH multi-profile).
+    candidates.append(hermes_home / "profiles" / "forge" / "cache" / "bws_cache.json")
+    candidates.append(hermes_home / "cache" / "bws_cache.json")
+    # Default-profile style
+    candidates.append(Path.home() / ".hermes" / "cache" / "bws_cache.json")
+
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+            import json
+
+            data = json.loads(path.read_text())
+            secrets = data.get("secrets")
+            if isinstance(secrets, dict) and secrets:
+                return {str(k): str(v) for k, v in secrets.items() if v}
+        except Exception:
+            continue
+    return {}
+
+
+_BWS_SECRETS: dict[str, str] | None = None
+
+
+def _secret(name: str) -> str | None:
+    """Env first, then BWS cache fallback for dashboard-without-gateway-env."""
+    global _BWS_SECRETS
+    v = (os.getenv(name) or "").strip()
+    if v:
+        return v
+    if _BWS_SECRETS is None:
+        _BWS_SECRETS = _bws_cache_secrets()
+    v = (_BWS_SECRETS.get(name) or "").strip()
+    return v or None
+
+
+def _env_key(*names: str) -> str | None:
+    """First non-empty secret among *names* (env, then BWS cache)."""
+    for name in names:
+        v = _secret(name)
+        if v:
+            return v
+    return None
+
+
+def _openai_base_is_official() -> bool:
+    """True when OPENAI_BASE_URL is unset or points at api.openai.com.
+
+    Forge may set OPENAI_API_KEY + OPENAI_BASE_URL to a FreeLLM / proxy
+    endpoint — that must not light up the OpenAI provider card.
+    """
+    base = (os.getenv("OPENAI_BASE_URL") or "").strip().lower()
+    if not base:
+        return True
+    return "api.openai.com" in base
+
+
+async def _fal(client: httpx.AsyncClient) -> dict[str, Any]:
+    """FAL: platform billing balance via Admin/API key.
+
+    Tries several Authorization shapes — model keys are often
+    ``key_id:key_secret`` while platform docs use ``Key <token>``.
+    """
+    key = _env_key("FAL_KEY", "FAL_API_KEY")
+    if not key:
+        return {"provider": "fal", "configured": False}
+    raw = key[4:].strip() if key.lower().startswith("key ") else key
+    auth_candidates = [
+        f"Key {raw}",
+        f"Key {key}",
+        key if key.lower().startswith("key ") else None,
+        f"Bearer {raw}",
+    ]
+    last_status = None
+    try:
+        for auth in auth_candidates:
+            if not auth:
+                continue
+            r = await client.get(
+                "https://api.fal.ai/v1/account/billing",
+                params={"expand": "credits"},
+                headers={"Authorization": auth, "Accept": "application/json"},
+            )
+            last_status = r.status_code
+            if r.status_code in (401, 403):
+                continue
+            if not r.is_success:
+                return {
+                    "provider": "fal",
+                    "configured": True,
+                    "ok": False,
+                    "error": f"HTTP {r.status_code}",
+                }
+            data = r.json()
+            credits = data.get("credits") or {}
+            balance = credits.get("current_balance")
+            return {
+                "provider": "fal",
+                "configured": True,
+                "ok": True,
+                "remaining_usd": float(balance) if balance is not None else None,
+                "currency": credits.get("currency") or "USD",
+                "username": data.get("username"),
+            }
+        return {
+            "provider": "fal",
+            "configured": True,
+            "ok": False,
+            "error": f"HTTP {last_status or 'auth'}",
+            "hint": (
+                "FAL billing requires an Admin-scoped API key "
+                "(create one at fal.ai/dashboard/keys with scope ADMIN). "
+                "API-scoped keys can call models but cannot read credit balance."
+            ),
+        }
+    except Exception as e:
+        return {"provider": "fal", "configured": True, "ok": False, "error": str(e)[:200]}
+
+
+async def _tavily(client: httpx.AsyncClient) -> dict[str, Any]:
+    """Tavily: key + account plan usage for the current billing cycle."""
+    key = _env_key("TAVILY_API_KEY")
+    if not key:
+        return {"provider": "tavily", "configured": False}
+    try:
+        r = await client.get(
+            "https://api.tavily.com/usage",
+            headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+        )
+        if not r.is_success:
+            return {
+                "provider": "tavily",
+                "configured": True,
+                "ok": False,
+                "error": f"HTTP {r.status_code}",
+            }
+        data = r.json()
+        key_info = data.get("key") or {}
+        account = data.get("account") or {}
+        # Prefer account plan numbers when present; fall back to key-scoped.
+        usage = account.get("plan_usage")
+        limit = account.get("plan_limit")
+        if usage is None:
+            usage = key_info.get("usage")
+        if limit is None:
+            limit = key_info.get("limit")
+        remaining = None
+        if usage is not None and limit is not None:
+            remaining = max(0, int(limit) - int(usage))
+        return {
+            "provider": "tavily",
+            "configured": True,
+            "ok": True,
+            "usage": int(usage) if usage is not None else None,
+            "limit": int(limit) if limit is not None else None,
+            "remaining": remaining,
+            "unit": "credits",
+        }
+    except Exception as e:
+        return {"provider": "tavily", "configured": True, "ok": False, "error": str(e)[:200]}
+
+
+async def _firecrawl(client: httpx.AsyncClient) -> dict[str, Any]:
+    """Firecrawl: team credit remaining."""
+    key = _env_key("FIRECRAWL_API_KEY")
+    if not key:
+        return {"provider": "firecrawl", "configured": False}
+    try:
+        r = await client.get(
+            "https://api.firecrawl.dev/v1/team/credit-usage",
+            headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+        )
+        if not r.is_success:
+            return {
+                "provider": "firecrawl",
+                "configured": True,
+                "ok": False,
+                "error": f"HTTP {r.status_code}",
+            }
+        data = r.json()
+        payload = data.get("data") if isinstance(data.get("data"), dict) else data
+        remaining = payload.get("remaining_credits")
+        plan = payload.get("plan_credits")
+        return {
+            "provider": "firecrawl",
+            "configured": True,
+            "ok": bool(data.get("success", True)),
+            "remaining": float(remaining) if remaining is not None else None,
+            "limit": float(plan) if plan is not None else None,
+            "unit": "credits",
+            "billing_period_end": payload.get("billing_period_end"),
+        }
+    except Exception as e:
+        return {"provider": "firecrawl", "configured": True, "ok": False, "error": str(e)[:200]}
+
+
+def _money_value(payload: Any) -> float | None:
+    """Parse Atlas MoneyValue ``{"value": "24.81", "currency": "usd"}``."""
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    if isinstance(payload, dict):
+        try:
+            return float(payload.get("value"))
+        except (TypeError, ValueError):
+            return None
+    if isinstance(payload, str):
+        try:
+            return float(payload)
+        except ValueError:
+            return None
+    return None
+
+
+async def _atlas(client: httpx.AsyncClient) -> dict[str, Any]:
+    """Atlas Cloud: public billing balance (forge image-gen / Seedream)."""
+    key = _env_key("ATLASCLOUD_API_KEY", "ATLAS_API_KEY")
+    if not key:
+        return {"provider": "atlas", "configured": False}
+    try:
+        r = await client.get(
+            "https://api.atlascloud.ai/public/v1/balance",
+            headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+        )
+        if not r.is_success:
+            return {
+                "provider": "atlas",
+                "configured": True,
+                "ok": False,
+                "error": f"HTTP {r.status_code}",
+            }
+        data = r.json()
+        available = _money_value(data.get("available"))
+        cash = _money_value(data.get("cash"))
+        bonus = _money_value(data.get("bonus"))
+        frozen = _money_value(data.get("frozen"))
+        account = data.get("account") if isinstance(data.get("account"), dict) else {}
+        return {
+            "provider": "atlas",
+            "configured": True,
+            "ok": True,
+            "remaining_usd": available,
+            "cash_usd": cash,
+            "bonus_usd": bonus,
+            "frozen_usd": frozen,
+            "account_type": account.get("type"),
+            "account_name": account.get("name") or None,
+        }
+    except Exception as e:
+        return {"provider": "atlas", "configured": True, "ok": False, "error": str(e)[:200]}
+
+
+async def _runpod(client: httpx.AsyncClient) -> dict[str, Any]:
+    """RunPod: GraphQL ``myself.clientBalance`` (USD credits)."""
+    key = _env_key("RUNPOD_API_KEY")
+    if not key:
+        return {"provider": "runpod", "configured": False}
+    try:
+        r = await client.post(
+            "https://api.runpod.io/graphql",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            json={
+                "query": (
+                    "query { myself { id email clientBalance "
+                    "currentSpendPerHr spendLimit } }"
+                )
+            },
+        )
+        if not r.is_success:
+            return {
+                "provider": "runpod",
+                "configured": True,
+                "ok": False,
+                "error": f"HTTP {r.status_code}",
+            }
+        body = r.json()
+        if body.get("errors"):
+            err0 = body["errors"][0] if isinstance(body["errors"], list) else body["errors"]
+            msg = err0.get("message") if isinstance(err0, dict) else str(err0)
+            return {
+                "provider": "runpod",
+                "configured": True,
+                "ok": False,
+                "error": str(msg)[:200],
+            }
+        me = (body.get("data") or {}).get("myself") or {}
+        balance = me.get("clientBalance")
+        spend = me.get("currentSpendPerHr")
+        return {
+            "provider": "runpod",
+            "configured": True,
+            "ok": True,
+            "remaining_usd": float(balance) if balance is not None else None,
+            "spend_per_hr_usd": float(spend) if spend is not None else None,
+            "spend_limit_usd": (
+                float(me["spendLimit"]) if me.get("spendLimit") is not None else None
+            ),
+            "email": me.get("email"),
+        }
+    except Exception as e:
+        return {"provider": "runpod", "configured": True, "ok": False, "error": str(e)[:200]}
+
+
+async def _replicate(client: httpx.AsyncClient) -> dict[str, Any]:
+    """Replicate: account probe only — no public credit-balance API."""
+    key = _env_key("REPLICATE_API_KEY", "REPLICATE_API_TOKEN")
+    if not key:
+        return {"provider": "replicate", "configured": False}
+    try:
+        r = await client.get(
+            "https://api.replicate.com/v1/account",
+            headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+        )
+        if not r.is_success:
+            return {
+                "provider": "replicate",
+                "configured": True,
+                "ok": False,
+                "error": f"HTTP {r.status_code}",
+            }
+        data = r.json()
+        return {
+            "provider": "replicate",
+            "configured": True,
+            "ok": True,
+            "username": data.get("username"),
+            "account_type": data.get("type"),
+            "name": data.get("name"),
+            "note": "Balance not exposed via API — check replicate.com/account/billing",
+        }
+    except Exception as e:
+        return {"provider": "replicate", "configured": True, "ok": False, "error": str(e)[:200]}
+
+
 async def _openai(client: httpx.AsyncClient) -> dict[str, Any]:
     """OpenAI / Codex: no balance endpoint; rate-limit headers come back on
     /chat/completions responses. For ChatGPT-subscription Codex auth, the
     standard OpenAI API rejects the token, so we just surface the plan info
     from the local auth.json (ChatGPT Plus/Pro shows here).
 
-    Auth precedence: OPENAI_API_KEY (real API) > Codex OAuth (subscription only).
+    Auth precedence: OPENAI_API_KEY (real API) > Codex OAuth (opt-in only).
+
+    Codex OAuth is opt-in via CREDITS_INCLUDE_CODEX=1 so hosts without an
+    OpenAI API key (e.g. OpenRouter-only forge) do not show a broken card.
     """
-    key = os.getenv("OPENAI_API_KEY")
+    key = _env_key("OPENAI_API_KEY")
+    # Proxy / FreeLLM keys often reuse OPENAI_API_KEY with a custom base URL.
+    if key and not _openai_base_is_official():
+        return {"provider": "openai", "configured": False}
     if not key:
+        include_codex = (os.getenv("CREDITS_INCLUDE_CODEX") or "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        if not include_codex:
+            return {"provider": "openai", "configured": False}
         # Fall back to Codex subscription metadata.
         access, tokens = _codex_token_from_file()
         if not access:
@@ -482,15 +841,25 @@ _CACHE_TTL = 300.0  # 5 minutes — Anthropic/OpenAI probes burn ~1 token each
 async def status(force: bool = False) -> dict[str, Any]:
     """Return per-provider credit status. Cached 5min to limit probe cost."""
     import time
+    global _BWS_SECRETS
     now = time.time()
     if not force and _CACHE["data"] and (now - _CACHE["at"]) < _CACHE_TTL:
         return {**_CACHE["data"], "cached": True, "age_seconds": int(now - _CACHE["at"])}
+
+    # Reload BWS cache each probe so newly synced forge secrets appear.
+    _BWS_SECRETS = None
 
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         results = await asyncio.gather(
             _openrouter(client),
             _anthropic(client),
             _openai(client),
+            _fal(client),
+            _atlas(client),
+            _runpod(client),
+            _replicate(client),
+            _tavily(client),
+            _firecrawl(client),
             return_exceptions=False,
         )
     providers = [p for p in results if p.get("configured")]

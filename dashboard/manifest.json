@@ -1,10 +1,14 @@
 {
   "name": "credits",
   "label": "Credits",
-  "description": "Provider credit/quota overview (OpenRouter, Anthropic)",
+  "description": "Provider credit/quota overview (OpenRouter, Anthropic, OpenAI, FAL, Atlas, RunPod, Replicate, Tavily, Firecrawl)",
   "icon": "Wallet",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "slots": ["analytics:top"],
+  "tab": {
+    "path": "/credits",
+    "position": "after:analytics"
+  },
   "entry": "dist/index.js",
   "api": "plugin_api.py"
 }
