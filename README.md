@@ -21,6 +21,7 @@ providers — no need to bounce between billing tabs or DIY OpenRouter probes.
 | **Replicate** | `REPLICATE_API_KEY` (or `REPLICATE_API_TOKEN`) | Key validity + username (no public balance API) |
 | **Tavily** | `TAVILY_API_KEY` | Credits used / plan limit for the billing cycle |
 | **Firecrawl** | `FIRECRAWL_API_KEY` | Remaining team credits |
+| **xAI** | `XAI_MANAGEMENT_KEY` (+ optional `XAI_TEAM_ID`) for balance; `XAI_API_KEY` alone shows key-ok | Prepaid `$` remaining via Management API (`management-api.x.ai`). Inference key cannot read billing. |
 
 Providers with no key are omitted from the UI entirely (no error cards).
 

@@ -205,23 +205,42 @@
       } else {
         main = React.createElement("span", { className: "text-xs text-destructive" }, p.error || "probe failed");
       }
-    } else if (name === "fal" || name === "atlas" || name === "runpod") {
+    } else if (name === "fal" || name === "atlas" || name === "runpod" || name === "xai") {
       if (p.ok && p.remaining_usd != null) {
-        main = React.createElement("div", { className: "flex items-baseline gap-2" },
-          React.createElement("span", { className: "text-2xl font-semibold tabular-nums" }, fmtUSD(p.remaining_usd)),
-          React.createElement("span", { className: "text-xs text-muted-foreground" }, "balance"),
-        );
+        const limit = p.limit_usd;
+        const usage = p.usage_usd;
+        if (name === "xai" && limit != null && usage != null) {
+          const pct = Math.min(100, Math.max(0, (usage / limit) * 100));
+          main = React.createElement("div", { className: "flex items-baseline gap-2" },
+            React.createElement("span", { className: "text-2xl font-semibold tabular-nums" }, fmtUSD(p.remaining_usd)),
+            React.createElement("span", { className: "text-xs text-muted-foreground" }, "remaining"),
+            React.createElement("span", { className: "text-xs text-muted-foreground ml-auto tabular-nums" },
+              fmtUSD(usage) + " / " + fmtUSD(limit) + " since top-up"),
+          );
+          barEl = bar(pct);
+        } else {
+          main = React.createElement("div", { className: "flex items-baseline gap-2" },
+            React.createElement("span", { className: "text-2xl font-semibold tabular-nums" }, fmtUSD(p.remaining_usd)),
+            React.createElement("span", { className: "text-xs text-muted-foreground" }, "balance"),
+          );
+        }
         if (name === "runpod" && p.spend_per_hr_usd != null && p.spend_per_hr_usd > 0) {
           footnote = "spend " + fmtUSD(p.spend_per_hr_usd) + "/hr";
         } else if (name === "atlas" && p.bonus_usd != null && p.bonus_usd > 0) {
           footnote = "incl. " + fmtUSD(p.bonus_usd) + " bonus";
+        } else if (name === "xai" && p.auth === "management") {
+          footnote = "xAI prepaid";
         } else if (p.username) {
           footnote = "@" + p.username;
         } else if (p.email) {
           footnote = p.email;
         }
       } else if (p.ok) {
-        main = React.createElement("span", { className: "text-sm text-muted-foreground" }, "key valid; no balance returned");
+        main = React.createElement("div", { className: "flex flex-col gap-1" },
+          React.createElement("span", { className: "text-sm text-muted-foreground" },
+            p.note || "key valid; no balance returned"),
+          p.hint && React.createElement("span", { className: "text-[10px] text-muted-foreground" }, p.hint),
+        );
       } else {
         main = React.createElement("div", { className: "flex flex-col gap-1" },
           React.createElement("span", { className: "text-xs text-destructive" }, p.error || "probe failed"),

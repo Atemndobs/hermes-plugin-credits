@@ -833,6 +833,149 @@ async def _openai(client: httpx.AsyncClient) -> dict[str, Any]:
         return {"provider": "openai", "configured": True, "ok": False, "error": str(e)[:200]}
 
 
+def _xai_cents_to_usd(val: Any) -> float | None:
+    """xAI prepaid amounts are USD cents as strings; credit remaining is negative."""
+    if val is None:
+        return None
+    try:
+        return abs(int(str(val))) / 100.0
+    except (TypeError, ValueError):
+        return None
+
+
+async def _xai_resolve_team_id(client: httpx.AsyncClient, mgmt_key: str) -> str | None:
+    """Prefer XAI_TEAM_ID env; else discover via management-key validation."""
+    explicit = _env_key("XAI_TEAM_ID")
+    if explicit:
+        return explicit
+    try:
+        r = await client.get(
+            "https://management-api.x.ai/auth/management-keys/validation",
+            headers={"Authorization": f"Bearer {mgmt_key}", "Accept": "application/json"},
+        )
+        if not r.is_success:
+            return None
+        data = r.json()
+        return (
+            (data.get("scopeId") or data.get("teamId") or "").strip() or None
+        )
+    except Exception:
+        return None
+
+
+async def _xai(client: httpx.AsyncClient) -> dict[str, Any]:
+    """xAI prepaid balance via Management API; inference key validates as fallback.
+
+    Balance requires ``XAI_MANAGEMENT_KEY`` (console → Management Keys) plus a
+    team id (``XAI_TEAM_ID`` or auto from validation). Plain ``XAI_API_KEY`` is
+    enough for inference / Hermes ``x_search`` but cannot read billing.
+    """
+    mgmt = _env_key("XAI_MANAGEMENT_KEY", "XAI_MANAGEMENT_API_KEY")
+    api_key = _env_key("XAI_API_KEY")
+    if not mgmt and not api_key:
+        return {"provider": "xai", "configured": False}
+
+    if mgmt:
+        team_id = await _xai_resolve_team_id(client, mgmt)
+        if not team_id:
+            return {
+                "provider": "xai",
+                "configured": True,
+                "ok": False,
+                "error": "team id missing",
+                "hint": (
+                    "Set XAI_TEAM_ID from console.x.ai → Team settings, "
+                    "or ensure the management key can call "
+                    "/auth/management-keys/validation."
+                ),
+            }
+        try:
+            r = await client.get(
+                f"https://management-api.x.ai/v1/billing/teams/{team_id}/prepaid/balance",
+                headers={"Authorization": f"Bearer {mgmt}", "Accept": "application/json"},
+            )
+            if not r.is_success:
+                return {
+                    "provider": "xai",
+                    "configured": True,
+                    "ok": False,
+                    "error": f"HTTP {r.status_code}",
+                    "hint": (
+                        "Management key needs billing read on this team. "
+                        "Create one at console.x.ai → Settings → Management Keys."
+                    ),
+                }
+            data = r.json()
+            remaining = _xai_cents_to_usd((data.get("total") or {}).get("val"))
+            # Newest-first ledger: sum SPEND until the most recent PURCHASE.
+            changes = data.get("changes") or []
+            spend_since_topup_usd = 0.0
+            last_topup_usd = None
+            saw_spend = False
+            for ch in changes:
+                origin = (ch.get("changeOrigin") or "").upper()
+                amt = _xai_cents_to_usd((ch.get("amount") or {}).get("val"))
+                if amt is None:
+                    continue
+                if origin == "SPEND" and last_topup_usd is None:
+                    spend_since_topup_usd += amt
+                    saw_spend = True
+                elif origin == "PURCHASE":
+                    last_topup_usd = amt
+                    break
+            if not saw_spend:
+                spend_since_topup_usd = None
+
+            out: dict[str, Any] = {
+                "provider": "xai",
+                "configured": True,
+                "ok": True,
+                "remaining_usd": remaining,
+                "currency": "USD",
+                "auth": "management",
+            }
+            if last_topup_usd is not None:
+                out["last_topup_usd"] = last_topup_usd
+            if spend_since_topup_usd is not None and last_topup_usd is not None:
+                out["usage_usd"] = spend_since_topup_usd
+                out["limit_usd"] = last_topup_usd
+            return out
+        except Exception as e:
+            return {
+                "provider": "xai",
+                "configured": True,
+                "ok": False,
+                "error": str(e)[:200],
+            }
+
+    # Inference key only — prove it works; no balance.
+    try:
+        r = await client.get(
+            "https://api.x.ai/v1/models",
+            headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+        )
+        if not r.is_success:
+            return {
+                "provider": "xai",
+                "configured": True,
+                "ok": False,
+                "error": f"HTTP {r.status_code}",
+            }
+        return {
+            "provider": "xai",
+            "configured": True,
+            "ok": True,
+            "auth": "api_key",
+            "note": "inference key ok",
+            "hint": (
+                "Add XAI_MANAGEMENT_KEY (console.x.ai → Management Keys) "
+                "to show prepaid credit balance."
+            ),
+        }
+    except Exception as e:
+        return {"provider": "xai", "configured": True, "ok": False, "error": str(e)[:200]}
+
+
 _CACHE: dict[str, Any] = {"at": 0.0, "data": None}
 _CACHE_TTL = 300.0  # 5 minutes — Anthropic/OpenAI probes burn ~1 token each
 
@@ -860,6 +1003,7 @@ async def status(force: bool = False) -> dict[str, Any]:
             _replicate(client),
             _tavily(client),
             _firecrawl(client),
+            _xai(client),
             return_exceptions=False,
         )
     providers = [p for p in results if p.get("configured")]

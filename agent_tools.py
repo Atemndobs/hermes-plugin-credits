@@ -40,7 +40,7 @@ CREDITS_STATUS_SCHEMA = {
     "name": "credits_status",
     "description": (
         "Fetch sanitized provider credit/balance status (OpenRouter, FAL, "
-        "Atlas, RunPod, Replicate, Tavily, Firecrawl, Anthropic, OpenAI). "
+        "Atlas, RunPod, Replicate, Tavily, Firecrawl, Anthropic, OpenAI, xAI). "
         "Use when the user asks about remaining credits, API spend, billing, "
         "or token balance. Never DIY OpenRouter/BWS key fetches — call this. "
         "Does not modify config."
@@ -59,7 +59,7 @@ CREDITS_STATUS_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Optional provider filter (openrouter, fal, atlas, runpod, "
-                    "replicate, tavily, firecrawl, anthropic, openai). "
+                    "replicate, tavily, firecrawl, anthropic, openai, xai). "
                     "Omit for all configured providers."
                 ),
             },
@@ -142,6 +142,8 @@ def format_provider_line(p: dict[str, Any]) -> str:
         name = "FAL"
     elif p.get("provider") == "runpod":
         name = "RunPod"
+    elif p.get("provider") == "xai":
+        name = "xAI"
 
     if not p.get("ok", True) and p.get("error"):
         return f"**{name}** — error: {p.get('error')}"
